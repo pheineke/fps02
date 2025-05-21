@@ -1,0 +1,14 @@
+{
+    "name": "threejs-fps-server",
+    "version": "1.0.0",
+    "description": "Server for a Three.js FPS game",
+    "main": "server.js",
+    "type": "module",
+    "scripts": {
+      "start": "node server.js"
+    },
+    "dependencies": {
+      "ws": "^8.13.0",
+      "uuid": "^9.0.0"
+    }
+  }
