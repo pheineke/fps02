@@ -98,8 +98,12 @@ wss.on('connection', (ws) => {
         currentWeapon: DEFAULT_WEAPON, lastStepTime: 0,
     };
     ws.send(JSON.stringify({
-        type: 'welcome', id: playerId, settings: gameSettings, players: players,
-        worldObjects: worldObjects, weaponData: WEAPON_DATA
+        type: 'welcome',
+        id: playerId, // ID des neuen Spielers
+        settings: gameSettings,
+        players: players, // << HIER: Alle Spieler, inkl. des gerade hinzugefügten
+        worldObjects: worldObjects,
+        weaponData: WEAPON_DATA
     }));
     broadcast({ type: 'playerJoined', player: stripPlayerData(players[playerId]) });
 
