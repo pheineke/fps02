@@ -1,124 +1,106 @@
-import { WebSocketServer, WebSocket } from 'ws'; // WebSocket hier importieren
+import { WebSocketServer, WebSocket } from 'ws';
 import { v4 as uuidv4 } from 'uuid';
 
 const wss = new WebSocketServer({ port: 8080 });
 console.log('WebSocket Server gestartet auf Port 8080');
 
+// --- Waffen Definitionen (Serverseitig für Schadensberechnung etc.) ---
+const WEAPON_DATA = {
+    'P2020': { name: 'P2020', damage: 18, fireRate: 330, type: 'pistol', ammo: 12, hitsToKill: Math.ceil(100/18), soundId: 'p2020' },
+    'R99': { name: 'R-99 SMG', damage: 11, fireRate: 90, type: 'smg', ammo: 20, hitsToKill: Math.ceil(100/11), soundId: 'r99' },
+    'Flatline': { name: 'VK-47 Flatline', damage: 19, fireRate: 580, type: 'rifle', ammo: 20, hitsToKill: Math.ceil(100/19), soundId: 'flatline' },
+    'Sentinel': { name: 'Sentinel', damage: 70, fireRate: 1250, type: 'sniper', ammo: 4, hitsToKill: Math.ceil(100/70), soundId: 'sentinel' },
+};
+const DEFAULT_WEAPON = 'P2020';
+
+
 const players = {};
-const projectiles = {}; // Nicht mehr wirklich genutzt für Hitscan, aber Struktur bleibt
 const gameSettings = {
-    gravity: -30,
-    playerSpeed: 10,
-    playerSprintSpeed: 15,
-    playerCrouchSpeed: 5,
-    jumpVelocity: 12,
-    slideBoost: 18, // Etwas reduziert für besseres Gefühl
-    slideDuration: 600, // ms
-    wallJumpBoost: 15,
-    wallStickTime: 250, // ms, etwas länger für einfachere Ausführung
-    maxHealth: 100,
-    damagePerHit: 5, // 100 / 5 = 20 hits
-    worldBounds: { x: 50, z: 50, y_min: -20 },
-    respawnHeight: 5,
-    maxRayDistance: 100, // Maximale Schussweite
+    gravity: -30, playerSpeed: 10, playerSprintSpeed: 15, playerCrouchSpeed: 5,
+    jumpVelocity: 12, slideBoost: 18, slideDuration: 600, wallJumpBoost: 15,
+    wallStickTime: 250, maxHealth: 100,
+    worldBounds: { x: 60, z: 60, y_min: -20 }, // Etwas größere Welt
+    respawnHeight: 5, maxRayDistance: 250,
+    stepSoundInterval: 350, 
 };
 
 const playerDimensions = {
-    height: 1.8,
-    crouchHeight: 1.0,
-    width: 0.5,
-    eyeHeightFactor: 0.9, // Faktor für Augenhöhe relativ zur Gesamthöhe
+    height: 1.8, crouchHeight: 1.0, width: 0.5, eyeHeightFactor: 0.9,
 };
 
-// Dummy world for collision
+// --- Weltobjekte / Gebäude ---
 const worldObjects = [
-    { id: 'wall1', type: 'box', position: { x: 10, y: 0, z: 0 }, size: { x: 2, y: 4, z: 10 }, color: 0xaaaaaa },
-    { id: 'obstacle1', type: 'box', position: { x: 0, y: 0, z: 10 }, size: { x: 10, y: 2, z: 2 }, color: 0xbbbbbb },
-    { id: 'platform1', type: 'box', position: { x: -10, y: 3, z: -5 }, size: { x: 5, y: 0.5, z: 5 }, color: 0xcccccc },
+    // Ein einfaches Gebäude
+    { id: 'b1_wall_n', type: 'box', position: { x: 0, y: 0, z: -15 }, size: { x: 20, y: 6, z: 0.5 }, color: 0x787878 },
+    { id: 'b1_wall_s_l', type: 'box', position: { x: -5.5, y: 0, z: 15 }, size: { x: 9, y: 6, z: 0.5 }, color: 0x787878 }, // Linker Teil der Südwand
+    { id: 'b1_wall_s_r', type: 'box', position: { x: 5.5, y: 0, z: 15 }, size: { x: 9, y: 6, z: 0.5 }, color: 0x787878 }, // Rechter Teil
+    // Über der Tür
+    { id: 'b1_wall_s_top', type: 'box', position: { x: 0, y: 3, z: 15 }, size: { x: 2, y: 3, z: 0.5 }, color: 0x787878 }, 
+
+    { id: 'b1_wall_e', type: 'box', position: { x: 10, y: 0, z: 0 }, size: { x: 0.5, y: 6, z: 30.5 }, color: 0x787878 },
+    { id: 'b1_wall_w', type: 'box', position: { x: -10, y: 0, z: 0 }, size: { x: 0.5, y: 6, z: 30.5 }, color: 0x787878 },
+    { id: 'b1_roof', type: 'box', position: { x: 0, y: 6, z: 0 }, size: { x: 20.5, y: 0.5, z: 30.5 }, color: 0x676767 },
+    // Öffnungen werden nicht als Kollisionsobjekte geführt, sondern sind Lücken zwischen Objekten.
+
+    // Deckungsobjekte
+    { id: 'cover1', type: 'box', position: { x: 20, y: 0, z: 10 }, size: { x: 1, y: 1.5, z: 4 }, color: 0x909090 },
+    { id: 'cover2', type: 'box', position: { x: -20, y: 0, z: -12 }, size: { x: 5, y: 1, z: 1.5 }, color: 0x909090 },
+    { id: 'platform_center', type: 'box', position: { x: 0, y: 3, z: 0 }, size: { x: 6, y: 0.5, z: 6 }, color: 0xa0a0a0, insideBuilding: true }, // Markierung für Sounds
+    { id: 'ramp_to_platform', type: 'ramp', position: {x: -6, y:0, z: 0}, size: {x:6, y:3, z:2}, color: 0xa05050, riseAxis: 'y', slopeDir: {x:1, y:0, z:0} }
 ];
 
 
-// --- Hilfsfunktionen für Kollision und Raycasting ---
 function rayIntersectsAABB(rayOrigin, rayDirection, aabbMin, aabbMax) {
     let tmin = -Infinity, tmax = Infinity;
-
-    for (let i = 0; i < 3; i++) { // Iterate over x, y, z
-        const invD = 1.0 / rayDirection[i]; // Sicherstellen, dass es float ist
+    for (let i = 0; i < 3; i++) {
+        const invD = 1.0 / rayDirection[i];
         let t0 = (aabbMin[i] - rayOrigin[i]) * invD;
         let t1 = (aabbMax[i] - rayOrigin[i]) * invD;
-
-        if (invD < 0.0) {
-            let temp = t0;
-            t0 = t1;
-            t1 = temp;
-        }
-
+        if (invD < 0.0) { let temp = t0; t0 = t1; t1 = temp; }
         tmin = Math.max(tmin, t0);
         tmax = Math.min(tmax, t1);
-
-        if (tmin > tmax) return null; // No intersection
+        if (tmin > tmax) return null;
     }
-    if (tmin < 0 && tmax < 0) return null; // Object is behind the ray
+    if (tmin < 0 && tmax < 0) return null;
     return tmin >= 0 ? tmin : (tmax >= 0 ? tmax : null);
 }
 
-function getPlayerAABB(player) {
-    const currentHeight = player.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height;
+function getPlayerAABB(playerPos, playerHeight, playerWidth) {
     return {
-        minX: player.position.x - playerDimensions.width / 2, maxX: player.position.x + playerDimensions.width / 2,
-        minY: player.position.y, maxY: player.position.y + currentHeight,
-        minZ: player.position.z - playerDimensions.width / 2, maxZ: player.position.z + playerDimensions.width / 2,
+        minX: playerPos.x - playerWidth / 2, maxX: playerPos.x + playerWidth / 2,
+        minY: playerPos.y, maxY: playerPos.y + playerHeight,
+        minZ: playerPos.z - playerWidth / 2, maxZ: playerPos.z + playerWidth / 2,
     };
 }
 
 function rayIntersectsPlayer(rayOrigin, rayDirection, targetPlayer, maxDistance = Infinity) {
-    const targetAABB = getPlayerAABB(targetPlayer);
-    const targetAABBMin = [targetAABB.minX, targetAABB.minY, targetAABB.minZ];
-    const targetAABBMax = [targetAABB.maxX, targetAABB.maxY, targetAABB.maxZ];
-
+    const pAABB = getPlayerAABB(targetPlayer.position, 
+        (targetPlayer.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height), 
+        playerDimensions.width);
+    const targetAABBMin = [pAABB.minX, pAABB.minY, pAABB.minZ];
+    const targetAABBMax = [pAABB.maxX, pAABB.maxY, pAABB.maxZ];
     const rayOriginArray = [rayOrigin.x, rayOrigin.y, rayOrigin.z];
     const rayDirectionArray = [rayDirection.x, rayDirection.y, rayDirection.z];
-
     const dist = rayIntersectsAABB(rayOriginArray, rayDirectionArray, targetAABBMin, targetAABBMax);
-
-    if (dist !== null && dist < maxDistance) {
-        return dist;
-    }
+    if (dist !== null && dist < maxDistance) return dist;
     return null;
 }
-
 
 wss.on('connection', (ws) => {
     const playerId = uuidv4();
     console.log(`Client ${playerId} verbunden.`);
-
     players[playerId] = {
-        id: playerId,
-        ws: ws,
-        username: "Guest" + Math.floor(Math.random() * 1000),
-        position: { x: Math.random() * 10 - 5, y: gameSettings.respawnHeight, z: Math.random() * 10 - 5 },
-        velocity: { x: 0, y: 0, z: 0 },
-        rotation: { x: 0, y: 0 },
-        health: gameSettings.maxHealth,
-        isCrouching: false,
-        isSprinting: false,
-        isSliding: false,
-        isOnGround: false,
-        lastWallContact: null,
-        lastShotTime: 0,
-        slideEndTime: 0,
-        inputs: { /* wird vom Client initialisiert */ }
+        id: playerId, ws: ws, username: "Guest" + Math.floor(Math.random() * 1000),
+        position: { x: Math.random() * 20 - 10, y: gameSettings.respawnHeight, z: Math.random() * 20 - 10 },
+        velocity: { x: 0, y: 0, z: 0 }, rotation: { x: 0, y: 0 }, health: gameSettings.maxHealth,
+        isCrouching: false, isSprinting: false, isSliding: false, isOnGround: false,
+        lastWallContact: null, lastShotTime: 0, slideEndTime: 0, inputs: {},
+        currentWeapon: DEFAULT_WEAPON, lastStepTime: 0,
     };
-
-    // Sende Weltobjekte einmalig beim Welcome
     ws.send(JSON.stringify({
-        type: 'welcome',
-        id: playerId,
-        settings: gameSettings,
-        players: players, // Alle aktuellen Spieler
-        worldObjects: worldObjects // Sende auch die Weltobjekte
+        type: 'welcome', id: playerId, settings: gameSettings, players: players,
+        worldObjects: worldObjects, weaponData: WEAPON_DATA
     }));
-
     broadcast({ type: 'playerJoined', player: stripPlayerData(players[playerId]) });
 
     ws.on('message', (message) => {
@@ -126,169 +108,101 @@ wss.on('connection', (ws) => {
             const data = JSON.parse(message);
             const player = players[playerId];
             if (!player) return;
-
             switch (data.type) {
-                case 'login':
-                    player.username = data.username || player.username;
-                    broadcast({ type: 'playerUpdated', player: stripPlayerData(player) });
-                    break;
-                case 'playerUpdate':
-                    if (data.inputs) player.inputs = data.inputs;
-                    if (data.rotation) player.rotation = data.rotation;
-                    break;
+                case 'login': player.username = data.username || player.username; broadcast({ type: 'playerUpdated', player: stripPlayerData(player) }); break;
+                case 'playerUpdate': if (data.inputs) player.inputs = data.inputs; if (data.rotation) player.rotation = data.rotation; break;
+                case 'selectWeapon':
+                    if (WEAPON_DATA[data.weaponId]) {
+                        player.currentWeapon = data.weaponId;
+                        console.log(`Spieler ${player.username} wählte ${player.currentWeapon}`);
+                        broadcast({type: 'playerWeaponChanged', playerId: playerId, weaponId: player.currentWeapon});
+                    } break;
                 case 'shoot':
-                    if (Date.now() - player.lastShotTime > 200) { // Fire rate limit
+                    const weapon = WEAPON_DATA[player.currentWeapon];
+                    if (!weapon) return;
+                    if (Date.now() - player.lastShotTime > weapon.fireRate) {
                         player.lastShotTime = Date.now();
-                        const shooterPlayer = player;
-                        const currentShooterHeight = shooterPlayer.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height;
-                        const shootOrigin = {
-                            x: shooterPlayer.position.x,
-                            y: shooterPlayer.position.y + currentShooterHeight * playerDimensions.eyeHeightFactor,
-                            z: shooterPlayer.position.z
-                        };
-
-                        let closestHitDistance = gameSettings.maxRayDistance;
-                        let hitTarget = null; // Kann Spieler-ID oder 'world' sein
-                        let hitPlayerId = null;
-
-                        // 1. Check for world object hits
-                        const rayDirArray = [data.direction.x, data.direction.y, data.direction.z];
-                        const shootOriginArray = [shootOrigin.x, shootOrigin.y, shootOrigin.z];
+                        const shooter = player;
+                        const shooterHeight = shooter.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height;
+                        const shootOrigin = { x: shooter.position.x, y: shooter.position.y + shooterHeight * playerDimensions.eyeHeightFactor, z: shooter.position.z };
+                        
+                        let closestHitDist = gameSettings.maxRayDistance;
+                        let hitTargetType = null, hitPlayerId = null;
+                        const rayDirArr = [data.direction.x, data.direction.y, data.direction.z];
+                        const shootOriginArr = [shootOrigin.x, shootOrigin.y, shootOrigin.z];
 
                         for (const obj of worldObjects) {
-                            const objAABBMin = [obj.position.x - obj.size.x / 2, obj.position.y, obj.position.z - obj.size.z / 2];
-                            const objAABBMax = [obj.position.x + obj.size.x / 2, obj.position.y + obj.size.y, obj.position.z + obj.size.z / 2];
-                            
-                            const worldHitDist = rayIntersectsAABB(shootOriginArray, rayDirArray, objAABBMin, objAABBMax);
-
-                            if (worldHitDist !== null && worldHitDist < closestHitDistance) {
-                                closestHitDistance = worldHitDist;
-                                hitTarget = 'world';
-                                hitPlayerId = null; // Wichtig zurücksetzen
+                            const objMin = [obj.position.x - obj.size.x / 2, obj.position.y, obj.position.z - obj.size.z / 2];
+                            const objMax = [obj.position.x + obj.size.x / 2, obj.position.y + obj.size.y, obj.position.z + obj.size.z / 2];
+                            const worldHit = rayIntersectsAABB(shootOriginArr, rayDirArr, objMin, objMax);
+                            if (worldHit !== null && worldHit < closestHitDist) {
+                                closestHitDist = worldHit; hitTargetType = 'world'; hitPlayerId = null;
                             }
                         }
-
-                        // 2. Check for player hits (nur wenn näher als Welthit oder kein Welthit)
                         for (const otherId in players) {
-                            if (otherId === playerId) continue;
-                            const targetPlayer = players[otherId];
-                            if (targetPlayer.health <= 0) continue; // Nicht auf tote Spieler schießen
-
-                            const playerHitDist = rayIntersectsPlayer(shootOrigin, data.direction, targetPlayer, closestHitDistance);
-
-                            if (playerHitDist !== null) { // playerHitDist ist jetzt die Distanz oder null
-                                closestHitDistance = playerHitDist;
-                                hitTarget = 'player';
-                                hitPlayerId = otherId;
+                            if (otherId === playerId || players[otherId].health <= 0) continue;
+                            const playerHit = rayIntersectsPlayer(shootOrigin, data.direction, players[otherId], closestHitDist);
+                            if (playerHit !== null) {
+                                closestHitDist = playerHit; hitTargetType = 'player'; hitPlayerId = otherId;
                             }
                         }
-                        
-                        // Client-seitiges Projektil (visuell)
-                        broadcast({ type: 'projectileFired', 
-                            playerId: playerId, 
-                            startPos: shootOrigin, // Start von Augenhöhe
-                            direction: data.direction, 
-                            hitTarget: hitTarget, // Sagen, was getroffen wurde
-                            hitDistance: closestHitDistance // Sagen, wo es getroffen hat
-                        });
-
-
-                        // 3. Process hit
-                        if (hitTarget === 'player' && hitPlayerId) {
-                            const pTarget = players[hitPlayerId];
-                            pTarget.health -= gameSettings.damagePerHit;
-                            broadcast({ type: 'hit', shooterId: playerId, targetId: hitPlayerId, damage: gameSettings.damagePerHit, newHealth: pTarget.health });
-                            console.log(`${shooterPlayer.username} hit ${pTarget.username} (${hitPlayerId}) for ${gameSettings.damagePerHit}. New health: ${pTarget.health}. Dist: ${closestHitDistance.toFixed(2)}`);
-                            if (pTarget.health <= 0) {
-                                respawnPlayer(pTarget);
-                            }
-                        } else if (hitTarget === 'world') {
-                            console.log(`${shooterPlayer.username}'s shot hit a wall at dist ${closestHitDistance.toFixed(2)}.`);
-                            // Optional: broadcast({ type: 'worldHit', position: { x: shootOrigin.x + data.direction.x * closestHitDistance, ... } });
+                        broadcast({ type: 'playerShot', playerId: playerId, weaponId: player.currentWeapon, startPos: shootOrigin, direction: data.direction, hitTarget: hitTargetType, hitDistance: closestHitDist });
+                        if (hitTargetType === 'player' && hitPlayerId) {
+                            const target = players[hitPlayerId];
+                            target.health = Math.max(0, target.health - weapon.damage);
+                            broadcast({ type: 'hit', shooterId: playerId, targetId: hitPlayerId, damage: weapon.damage, newHealth: target.health });
+                            if (target.health <= 0) respawnPlayer(target);
                         }
-                    }
-                    break;
+                    } break;
             }
-        } catch (e) {
-            console.error('Fehler beim Verarbeiten der Nachricht:', e, message.toString());
-        }
+        } catch (e) { console.error('Msg Error:', e, message.toString()); }
     });
-
-    ws.on('close', () => {
-        console.log(`Client ${playerId} getrennt.`);
-        delete players[playerId];
-        broadcast({ type: 'playerLeft', id: playerId });
-    });
+    ws.on('close', () => { console.log(`Client ${playerId} getrennt.`); delete players[playerId]; broadcast({ type: 'playerLeft', id: playerId }); });
 });
 
 function stripPlayerData(player) {
     return {
-        id: player.id,
-        username: player.username,
-        position: player.position,
-        velocity: player.velocity, // Sende auch Velocity für Debug im Client
-        rotation: player.rotation,
-        health: player.health,
-        isCrouching: player.isCrouching,
-        isSliding: player.isSliding,
-        isOnGround: player.isOnGround, // Sende auch isOnGround für Debug
+        id: player.id, username: player.username, position: player.position, velocity: player.velocity,
+        rotation: player.rotation, health: player.health, isCrouching: player.isCrouching,
+        isSliding: player.isSliding, isOnGround: player.isOnGround, currentWeapon: player.currentWeapon,
     };
 }
-
-function broadcast(data) {
-    const message = JSON.stringify(data);
-    wss.clients.forEach(client => {
-        if (client.readyState === WebSocket.OPEN) { // WebSocket ist hier definiert (Import)
-            client.send(message);
-        }
-    });
-}
-
+function broadcast(data) { const msg = JSON.stringify(data); wss.clients.forEach(c => { if (c.readyState === WebSocket.OPEN) c.send(msg); });}
 function respawnPlayer(player) {
     player.health = gameSettings.maxHealth;
-    player.position = { x: Math.random() * 20 - 10, y: gameSettings.respawnHeight, z: Math.random() * 20 - 10 };
-    player.velocity = { x: 0, y: 0, z: 0 };
-    player.isSliding = false;
+    player.position = { x: (Math.random() * 2 - 1) * (gameSettings.worldBounds.x*0.8), y: gameSettings.respawnHeight, z: (Math.random() * 2 - 1) * (gameSettings.worldBounds.z*0.8) };
+    player.velocity = { x: 0, y: 0, z: 0 }; player.isSliding = false;
     broadcast({ type: 'playerRespawn', player: stripPlayerData(player) });
-    console.log(`${player.username} respawned.`);
 }
 
-
-function checkWorldCollision(player, nextPosition) {
-    let collision = null;
-    const playerCurrentHeight = player.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height;
-    const playerAABB = {
-        minX: nextPosition.x - playerDimensions.width / 2, maxX: nextPosition.x + playerDimensions.width / 2,
-        minY: nextPosition.y, maxY: nextPosition.y + playerCurrentHeight,
-        minZ: nextPosition.z - playerDimensions.width / 2, maxZ: nextPosition.z + playerDimensions.width / 2,
+// Die `checkWorldCollision` Funktion von unserer letzten funktionierenden Version:
+function checkWorldCollision(player, currentPos, desiredMovementDelta) {
+    let resolvedPosition = { ...currentPos }; 
+    let nextPositionAttempt = {
+        x: currentPos.x + desiredMovementDelta.x,
+        y: currentPos.y + desiredMovementDelta.y,
+        z: currentPos.z + desiredMovementDelta.z,
     };
 
-    let onGroundCandidate = false;
+    let collisionInfo = { occurred: false, normal: { x: 0, y: 0, z: 0 }, isGroundCollision: false };
+    const playerCurrentHeight = player.isCrouching ? playerDimensions.crouchHeight : playerDimensions.height;
 
-    // Ground collision
-    if (nextPosition.y < 0) {
-        nextPosition.y = 0;
+    // Bodenkollision y=0
+    if (nextPositionAttempt.y < 0) { 
+        resolvedPosition.y = 0;
         player.velocity.y = 0;
-        onGroundCandidate = true;
-        collision = { normal: { x: 0, y: 1, z: 0 } };
+        collisionInfo.isGroundCollision = true; // Mark as ground collision
+        collisionInfo.occurred = true;
+        collisionInfo.normal = { x: 0, y: 1, z: 0 };
+    } else {
+        resolvedPosition.y = nextPositionAttempt.y; 
     }
 
-    // World bounds
-    if (Math.abs(nextPosition.x) > gameSettings.worldBounds.x) {
-        nextPosition.x = Math.sign(nextPosition.x) * gameSettings.worldBounds.x;
-        player.velocity.x = 0;
-        collision = collision || { normal: { x: -Math.sign(nextPosition.x), y: 0, z: 0 } };
-    }
-    if (Math.abs(nextPosition.z) > gameSettings.worldBounds.z) {
-        nextPosition.z = Math.sign(nextPosition.z) * gameSettings.worldBounds.z;
-        player.velocity.z = 0;
-        collision = collision || { normal: { x: 0, y: 0, z: -Math.sign(nextPosition.z) } };
-    }
-    if (nextPosition.y < gameSettings.worldBounds.y_min) {
-        respawnPlayer(player);
-        return null; // Abbrechen, da respawnt
-    }
+    // Temporäre Positionen für Achsen-Tests
+    let tempPosX = resolvedPosition.x + desiredMovementDelta.x; // Start from current y-resolved, desired x
+    let tempPosZ = resolvedPosition.z + desiredMovementDelta.z; // Start from current y-resolved, desired z
     
+    let colNormal = {x:0, y:0, z:0}; // Wird von der ersten signifikanten Kollision gesetzt
 
     for (const obj of worldObjects) {
         const objAABB = {
@@ -297,194 +211,185 @@ function checkWorldCollision(player, nextPosition) {
             minZ: obj.position.z - obj.size.z / 2, maxZ: obj.position.z + obj.size.z / 2,
         };
 
-        if (playerAABB.maxX > objAABB.minX && playerAABB.minX < objAABB.maxX &&
-            playerAABB.maxY > objAABB.minY && playerAABB.minY < objAABB.maxY &&
-            playerAABB.maxZ > objAABB.minZ && playerAABB.minZ < objAABB.maxZ) {
+        // Teste X-Achse
+        const playerAABB_X = getPlayerAABB({x: tempPosX, y: resolvedPosition.y, z: resolvedPosition.z}, playerCurrentHeight, playerDimensions.width);
+        if (playerAABB_X.maxX > objAABB.minX && playerAABB_X.minX < objAABB.maxX &&
+            playerAABB_X.maxY > objAABB.minY && playerAABB_X.minY < objAABB.maxY &&
+            playerAABB_X.maxZ > objAABB.minZ && playerAABB_X.minZ < objAABB.maxZ) {
             
-            const dx = (playerAABB.minX + playerAABB.maxX) / 2 - (objAABB.minX + objAABB.maxX) / 2;
-            const dy = (playerAABB.minY + playerAABB.maxY) / 2 - (objAABB.minY + objAABB.maxY) / 2;
-            const dz = (playerAABB.minZ + playerAABB.maxZ) / 2 - (objAABB.minZ + objAABB.maxZ) / 2;
-            
-            const widths = (playerAABB.maxX - playerAABB.minX) / 2 + (objAABB.maxX - objAABB.minX) / 2;
-            const heights = (playerAABB.maxY - playerAABB.minY) / 2 + (objAABB.maxY - objAABB.minY) / 2;
-            const depths = (playerAABB.maxZ - playerAABB.minZ) / 2 + (objAABB.maxZ - objAABB.minZ) / 2;
-
-            const overlapX = widths - Math.abs(dx);
-            const overlapY = heights - Math.abs(dy);
-            const overlapZ = depths - Math.abs(dz);
-
-            let normal = {x:0, y:0, z:0};
-
-            if (overlapY < overlapX && overlapY < overlapZ) {
-                nextPosition.y -= Math.sign(dy) * overlapY;
-                player.velocity.y = 0;
-                if (Math.sign(dy) < 0) { // Landed on top
-                    onGroundCandidate = true;
-                    normal = {x:0, y:1, z:0};
-                } else { normal = {x:0, y:-1, z:0}; } // Hit head
-            } else if (overlapX < overlapZ) {
-                nextPosition.x -= Math.sign(dx) * overlapX;
-                player.velocity.x = 0;
-                normal = {x:-Math.sign(dx), y:0, z:0};
-            } else {
-                nextPosition.z -= Math.sign(dz) * overlapZ;
-                player.velocity.z = 0;
-                normal = {x:0, y:0, z:-Math.sign(dz)};
+            const overlapX = (playerDimensions.width / 2 + obj.size.x / 2) - Math.abs(tempPosX - obj.position.x);
+            if (overlapX > 0) {
+                const pushSign = Math.sign(tempPosX - obj.position.x);
+                tempPosX = obj.position.x + pushSign * (obj.size.x / 2 + playerDimensions.width / 2 + 0.001);
+                player.velocity.x = 0; 
+                colNormal = { x: pushSign, y: 0, z: 0 };
+                collisionInfo.occurred = true;
             }
-            collision = collision || { normal }; // Behalte vorherige Kollision, wenn dies die erste ist
         }
-    }
-    player.isOnGround = onGroundCandidate; // Setze isOnGround basierend auf den Kollisionen dieses Frames
-    return collision;
-}
+        resolvedPosition.x = tempPosX; // Akzeptiere die (möglicherweise korrigierte) X-Position
 
+        // Teste Z-Achse (mit der jetzt korrigierten X-Position)
+        const playerAABB_Z = getPlayerAABB({x: resolvedPosition.x, y: resolvedPosition.y, z: tempPosZ}, playerCurrentHeight, playerDimensions.width);
+         if (playerAABB_Z.maxX > objAABB.minX && playerAABB_Z.minX < objAABB.maxX &&
+            playerAABB_Z.maxY > objAABB.minY && playerAABB_Z.minY < objAABB.maxY &&
+            playerAABB_Z.maxZ > objAABB.minZ && playerAABB_Z.minZ < objAABB.maxZ) {
+            
+            const overlapZ = (playerDimensions.width / 2 + obj.size.z / 2) - Math.abs(tempPosZ - obj.position.z);
+            if (overlapZ > 0) {
+                const pushSign = Math.sign(tempPosZ - obj.position.z);
+                tempPosZ = obj.position.z + pushSign * (obj.size.z / 2 + playerDimensions.width / 2 + 0.001);
+                player.velocity.z = 0;
+                // Nur Z-Normale setzen, wenn keine X-Kollision priorisiert wurde oder wenn diese stärker ist
+                if (!collisionInfo.occurred || Math.abs(colNormal.x) < 0.1) {
+                     colNormal = { x: 0, y: 0, z: pushSign };
+                }
+                collisionInfo.occurred = true;
+            }
+        }
+        resolvedPosition.z = tempPosZ;
+
+        // Teste Y-Achse (mit den jetzt korrigierten X und Z Positionen)
+        // Dies ist wichtig, um auf Objekten zu landen oder unter Decken zu stoppen
+        const playerAABB_Y = getPlayerAABB(resolvedPosition, playerCurrentHeight, playerDimensions.width);
+        if (playerAABB_Y.maxX > objAABB.minX && playerAABB_Y.minX < objAABB.maxX &&
+            playerAABB_Y.maxY > objAABB.minY && playerAABB_Y.minY < objAABB.maxY &&
+            playerAABB_Y.maxZ > objAABB.minZ && playerAABB_Y.minZ < objAABB.maxZ) {
+
+            const overlapY = (playerCurrentHeight / 2 + obj.size.y / 2) - Math.abs((resolvedPosition.y + playerCurrentHeight/2) - (obj.position.y + obj.size.y/2));
+            if(overlapY > 0){
+                const pushSignY = Math.sign((resolvedPosition.y + playerCurrentHeight/2) - (obj.position.y + obj.size.y/2));
+                resolvedPosition.y = (obj.position.y + obj.size.y/2) + pushSignY * (obj.size.y/2 + playerCurrentHeight/2 + 0.001) - playerCurrentHeight/2;
+                player.velocity.y = 0;
+
+                if (pushSignY > 0 && overlapY > 0.01) { // Von unten gegen Objekt oder darauf gelandet
+                    collisionInfo.isGroundCollision = true;
+                    colNormal = { x: 0, y: 1, z: 0 }; // Dominante Bodennormale
+                } else {
+                    colNormal = { x: 0, y: -1, z: 0 }; // Decke
+                }
+                collisionInfo.occurred = true;
+            }
+        }
+        if(collisionInfo.occurred && obj.type !== 'ramp') break; // Nur eine Kollision pro Frame mit normalen Boxen
+                                                    // Rampen könnten mehrere Iterationen benötigen oder eine andere Logik
+    }
+    
+    // Wenn eine Kollision aufgetreten ist, setze die Normale für Walljump etc.
+    if (collisionInfo.occurred) {
+        player.lastWallContact = (Math.abs(colNormal.y) < 0.7 && (Math.abs(colNormal.x) > 0.1 || Math.abs(colNormal.z) > 0.1)) ? 
+                                 { normal: colNormal, time: Date.now() } : null;
+    } else {
+        player.lastWallContact = null;
+    }
+    
+    player.isOnGround = collisionInfo.isGroundCollision;
+
+    // World Bounds am Ende
+    if (Math.abs(resolvedPosition.x) > gameSettings.worldBounds.x) {
+        resolvedPosition.x = Math.sign(resolvedPosition.x) * gameSettings.worldBounds.x; player.velocity.x = 0;
+    }
+    if (Math.abs(resolvedPosition.z) > gameSettings.worldBounds.z) {
+        resolvedPosition.z = Math.sign(resolvedPosition.z) * gameSettings.worldBounds.z; player.velocity.z = 0;
+    }
+    if (resolvedPosition.y < gameSettings.worldBounds.y_min) { respawnPlayer(player); return currentPos; }
+
+    return resolvedPosition;
+}
 
 function gameLoop() {
     const deltaTime = 1 / 60;
-
     for (const playerId in players) {
         const player = players[playerId];
-        if (!player.inputs) continue; // Spieler noch nicht vollständig initialisiert
-        const inputs = player.inputs;
-
-        player.isSprinting = inputs.sprint && !player.isCrouching && !player.isSliding; // Update isSprinting state
-
+        if (!player.inputs || Object.keys(player.inputs).length === 0) continue; 
+        const inputs = player.inputs; 
+        const oldPos = { ...player.position };
+        player.isSprinting = inputs.sprint && !player.isCrouching && !player.isSliding;
+        
         let currentSpeed = gameSettings.playerSpeed;
         if (player.isSprinting) currentSpeed = gameSettings.playerSprintSpeed;
         if (player.isCrouching && !player.isSliding) currentSpeed = gameSettings.playerCrouchSpeed;
         
         let moveDirection = { x: 0, z: 0 };
-        if (inputs.forward) {
-            moveDirection.x -= Math.sin(player.rotation.y);
-            moveDirection.z -= Math.cos(player.rotation.y);
-        }
-        // ... (backward, left, right as before) ...
-        if (inputs.backward) {
-            moveDirection.x += Math.sin(player.rotation.y);
-            moveDirection.z += Math.cos(player.rotation.y);
-        }
-        if (inputs.left) {
-            moveDirection.x += Math.sin(player.rotation.y - Math.PI / 2);
-            moveDirection.z += Math.cos(player.rotation.y - Math.PI / 2);
-        }
-        if (inputs.right) {
-            moveDirection.x += Math.sin(player.rotation.y + Math.PI / 2);
-            moveDirection.z += Math.cos(player.rotation.y + Math.PI / 2);
-        }
-
-        const len = Math.sqrt(moveDirection.x * moveDirection.x + moveDirection.z * moveDirection.z);
-        if (len > 0) {
-            moveDirection.x /= len;
-            moveDirection.z /= len;
-        }
+        if (inputs.forward) { moveDirection.x -= Math.sin(player.rotation.y); moveDirection.z -= Math.cos(player.rotation.y); }
+        if (inputs.backward) { moveDirection.x += Math.sin(player.rotation.y); moveDirection.z += Math.cos(player.rotation.y); }
+        if (inputs.left) { moveDirection.x += Math.sin(player.rotation.y - Math.PI / 2); moveDirection.z += Math.cos(player.rotation.y - Math.PI / 2); }
+        if (inputs.right) { moveDirection.x += Math.sin(player.rotation.y + Math.PI / 2); moveDirection.z += Math.cos(player.rotation.y + Math.PI / 2); }
+        const moveDirectionLength = Math.sqrt(moveDirection.x**2 + moveDirection.z**2);
+        if (moveDirectionLength > 0) { moveDirection.x /= moveDirectionLength; moveDirection.z /= moveDirectionLength; }
         
-        const targetVelX = moveDirection.x * currentSpeed;
-        const targetVelZ = moveDirection.z * currentSpeed;
+        if (player.isOnGround) {
+            const targetVelX = moveDirection.x * currentSpeed;
+            const targetVelZ = moveDirection.z * currentSpeed;
+            const groundAccelFactor = player.isSliding ? 0.04 : 0.25;
+            player.velocity.x += (targetVelX - player.velocity.x) * groundAccelFactor;
+            player.velocity.z += (targetVelZ - player.velocity.z) * groundAccelFactor;
+        } else {
+            const airWishSpeed = gameSettings.playerSpeed * 1.1; // Etwas mehr Kontrolle in der Luft
+            const airAccelerationValue = 35; 
+            if (moveDirectionLength > 0.01) {
+                const currentSpeedInWishDir = player.velocity.x * moveDirection.x + player.velocity.z * moveDirection.z;
+                let addSpeed = airWishSpeed - currentSpeedInWishDir;
+                if (addSpeed > 0) {
+                    let accel = airAccelerationValue * deltaTime;
+                    if (accel > addSpeed) accel = addSpeed;
+                    player.velocity.x += moveDirection.x * accel;
+                    player.velocity.z += moveDirection.z * accel;
+                }
+            }
+        }
 
-        // Interpoliere zur Zielgeschwindigkeit für smoothe Beschleunigung/Verzögerung
-        // und Air Control
-        const accelFactor = player.isOnGround ? (player.isSliding ? 0.02 : 0.1) : 0.03; // slide hat weniger kontrolle
-        player.velocity.x += (targetVelX - player.velocity.x) * accelFactor;
-        player.velocity.z += (targetVelZ - player.velocity.z) * accelFactor;
-
-
-        // --- Crouching ---
-        // isCrouching wird direkt vom Input gesetzt (oder Slide)
         const wantsToCrouch = inputs.crouch;
-
-
-        // --- Sliding ---
-        if (wantsToCrouch && player.isSprinting && player.isOnGround && !player.isSliding && Math.sqrt(player.velocity.x**2 + player.velocity.z**2) > gameSettings.playerSpeed * 0.8 ) {
-            player.isSliding = true;
-            player.isCrouching = true; // Sliden impliziert Ducken
+        if (wantsToCrouch && player.isSprinting && player.isOnGround && !player.isSliding && Math.sqrt(player.velocity.x**2 + player.velocity.z**2) > gameSettings.playerSpeed * 0.6 ) {
+            player.isSliding = true; player.isCrouching = true;
             player.slideEndTime = Date.now() + gameSettings.slideDuration;
-            
-            const slideDir = {x: player.velocity.x, z: player.velocity.z};
-            const currentSpeedMag = Math.sqrt(slideDir.x**2 + slideDir.z**2);
-            if (currentSpeedMag > 0.1) { // Normieren
-                slideDir.x /= currentSpeedMag;
-                slideDir.z /= currentSpeedMag;
-            } else { // Wenn keine Bewegung, dann in Blickrichtung
-                 slideDir.x = Math.sin(player.rotation.y);
-                 slideDir.z = Math.cos(player.rotation.y);
-            }
-            player.velocity.x += slideDir.x * gameSettings.slideBoost;
-            player.velocity.z += slideDir.z * gameSettings.slideBoost;
-            console.log(player.username, "started sliding. Vel:", player.velocity.x.toFixed(1), player.velocity.z.toFixed(1));
+            let slideBoostDir = {x: player.velocity.x, z: player.velocity.z};
+            const currentSpeedMagForBoost = Math.sqrt(slideBoostDir.x**2 + slideBoostDir.z**2);
+            if (currentSpeedMagForBoost > 0.5) { slideBoostDir.x /= currentSpeedMagForBoost; slideBoostDir.z /= currentSpeedMagForBoost; }
+            else { slideBoostDir.x = Math.sin(player.rotation.y); slideBoostDir.z = Math.cos(player.rotation.y); }
+            player.velocity.x += slideBoostDir.x * gameSettings.slideBoost;
+            player.velocity.z += slideBoostDir.z * gameSettings.slideBoost;
         }
-        
-        if (player.isSliding) {
-            if (Date.now() > player.slideEndTime || !wantsToCrouch || player.velocity.x * player.velocity.x + player.velocity.z * player.velocity.z < 2*2) {
-                player.isSliding = false;
-                // player.isCrouching bleibt true, wenn die Taste gehalten wird
-            }
+        if (player.isSliding && (Date.now() > player.slideEndTime || !wantsToCrouch || (player.velocity.x**2 + player.velocity.z**2 < 2**2 && player.isOnGround))) {
+            player.isSliding = false;
         }
-        // Update isCrouching basierend auf Input und Slide-Status
         player.isCrouching = wantsToCrouch || player.isSliding;
 
-
-        // --- Jumping & Wall Jumping ---
         if (inputs.jump && player.isOnGround) {
-            player.velocity.y = gameSettings.jumpVelocity;
-            player.isOnGround = false; // Wichtig, um Mehrfachsprünge zu verhindern
-            console.log(player.username, "jumped");
+            player.velocity.y = gameSettings.jumpVelocity; player.isOnGround = false;
         } else if (inputs.jump && player.lastWallContact && Date.now() - player.lastWallContact.time < gameSettings.wallStickTime) {
-            player.velocity.y = gameSettings.jumpVelocity * 0.9; // Guter Walljump
+            player.velocity.y = gameSettings.jumpVelocity * 0.85;
             player.velocity.x = player.lastWallContact.normal.x * gameSettings.wallJumpBoost;
             player.velocity.z = player.lastWallContact.normal.z * gameSettings.wallJumpBoost;
-            player.lastWallContact = null;
-            player.isOnGround = false;
-            console.log(player.username, "wall jumped");
+            player.lastWallContact = null; player.isOnGround = false;
         }
-        player.inputs.jump = false; // Jump-Input immer konsumieren
+        player.inputs.jump = false;
 
+        if (!player.isOnGround) player.velocity.y += gameSettings.gravity * deltaTime;
+        else if (player.velocity.y < 0) player.velocity.y = 0;
 
-        // --- Gravity ---
-        if (!player.isOnGround) {
-            player.velocity.y += gameSettings.gravity * deltaTime;
+        const desiredMovementDelta = { x: player.velocity.x * deltaTime, y: player.velocity.y * deltaTime, z: player.velocity.z * deltaTime };
+        const newPosition = checkWorldCollision(player, player.position, desiredMovementDelta);
+        player.position = newPosition;
+
+        const distMovedSqr = (player.position.x - oldPos.x)**2 + (player.position.z - oldPos.z)**2;
+        if (player.isOnGround && !player.isSliding && distMovedSqr > (0.05*0.05) && (Math.abs(player.velocity.x) > 0.5 || Math.abs(player.velocity.z) > 0.5) ) {
+            const stepInterval = player.isSprinting ? gameSettings.stepSoundInterval / 1.4 : (player.isCrouching ? gameSettings.stepSoundInterval * 1.5 : gameSettings.stepSoundInterval);
+            if (Date.now() - player.lastStepTime > stepInterval) {
+                player.lastStepTime = Date.now();
+                broadcast({ type: 'playerStep', playerId: playerId, position: player.position });
+            }
         }
-
-        // --- Friction/Damping (nur wenn am Boden und nicht sliden) ---
-        if (player.isOnGround && !player.isSliding && (Math.abs(moveDirection.x) < 0.1 && Math.abs(moveDirection.z) < 0.1)) {
-            player.velocity.x *= 0.85; // Stärkere Reibung bei keiner Eingabe
-            player.velocity.z *= 0.85;
-        } else if (player.isSliding) {
-             player.velocity.x *= 0.99; // Slide Reibung
-             player.velocity.z *= 0.99;
-        } else if (!player.isOnGround) {
-            player.velocity.x *= 0.995; // Leichte Luftreibung
-            player.velocity.z *= 0.995;
-        }
-
-
-        if (Math.abs(player.velocity.x) < 0.01 && player.isOnGround) player.velocity.x = 0;
-        if (Math.abs(player.velocity.z) < 0.01 && player.isOnGround) player.velocity.z = 0;
         
-        let nextPosition = {
-            x: player.position.x + player.velocity.x * deltaTime,
-            y: player.position.y + player.velocity.y * deltaTime,
-            z: player.position.z + player.velocity.z * deltaTime,
-        };
-
-        const collisionInfo = checkWorldCollision(player, nextPosition);
-        player.position = nextPosition;
-
-        if (collisionInfo && !player.isOnGround) {
-             if (Math.abs(collisionInfo.normal.y) < 0.7) { // Nicht primär Boden/Decke
-                player.lastWallContact = { normal: collisionInfo.normal, time: Date.now() };
-             } else {
-                player.lastWallContact = null; // Kollision mit Boden/Decke löscht Wall Contact
-             }
-        } else if (player.isOnGround) {
-            player.lastWallContact = null;
-        }
+        const noHorizontalInput = moveDirectionLength < 0.1;
+        if (player.isOnGround) {
+            if (!player.isSliding && noHorizontalInput) { player.velocity.x *= 0.70; player.velocity.z *= 0.70; }
+            else if (player.isSliding) { player.velocity.x *= 0.975; player.velocity.z *= 0.975; }
+        } else { const airDamping = 0.993; player.velocity.x *= airDamping; player.velocity.z *= airDamping; }
+        if (player.isOnGround && noHorizontalInput && Math.abs(player.velocity.x) < 0.05) player.velocity.x = 0;
+        if (player.isOnGround && noHorizontalInput && Math.abs(player.velocity.z) < 0.05) player.velocity.z = 0;
+        if(player.isOnGround) player.lastWallContact = null;
     }
-
-    const allPlayersData = {};
-    for (const id in players) {
-        allPlayersData[id] = stripPlayerData(players[id]);
-    }
+    const allPlayersData = {}; for (const id in players) allPlayersData[id] = stripPlayerData(players[id]);
     broadcast({ type: 'gameStateUpdate', players: allPlayersData });
 }
-
 setInterval(gameLoop, 1000 / 60);
